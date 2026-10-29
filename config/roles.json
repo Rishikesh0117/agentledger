@@ -1,0 +1,6 @@
+{
+  "roles": {
+    "reader": ["read_document", "lookup_record"],
+    "operator": ["read_document", "lookup_record", "draft_message", "send_email", "update_status"]
+  }
+}
