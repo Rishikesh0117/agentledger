@@ -1,5 +1,6 @@
 """AgentLedger: accountability layer for AI agents."""
 
+from agentledger.agent import ProposedAction, ScriptedAgent, parse_action_json
 from agentledger.config import (
     API_KEY_ENV_VAR,
     Roles,
@@ -19,6 +20,16 @@ from agentledger.ledger import (
     canonical_json,
     compute_hash,
 )
+from agentledger.pipeline import (
+    AllowAllGuardian,
+    AllowAllPolicy,
+    ApprovalDecision,
+    AutoApprove,
+    GuardianVerdict,
+    PolicyDecision,
+    RunResult,
+    run_agent,
+)
 from agentledger.tools import (
     TOOLS,
     ToolContext,
@@ -33,11 +44,20 @@ __all__ = [
     "API_KEY_ENV_VAR",
     "GENESIS_PREV_HASH",
     "TOOLS",
+    "AllowAllGuardian",
+    "AllowAllPolicy",
+    "ApprovalDecision",
+    "AutoApprove",
     "Event",
     "EventType",
+    "GuardianVerdict",
     "LedgerStore",
+    "PolicyDecision",
+    "ProposedAction",
     "Roles",
     "Run",
+    "RunResult",
+    "ScriptedAgent",
     "Settings",
     "ToolContext",
     "ToolError",
@@ -51,5 +71,7 @@ __all__ = [
     "load_dotenv",
     "load_roles",
     "load_settings",
+    "parse_action_json",
+    "run_agent",
     "run_tool",
 ]

@@ -153,6 +153,29 @@ class LedgerStore:
         self._db.commit()
         return run
 
+    def get_run(self, run_id: str) -> Run:
+        row = self._db.execute(
+            "SELECT id, task, agent_role, started_at, status FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown run_id: {run_id!r}")
+        rid, task, agent_role, started_at, status = row
+        return Run(
+            id=rid,
+            task=task,
+            agent_role=agent_role,
+            started_at=datetime.fromisoformat(started_at),
+            status=status,
+        )
+
+    def finish_run(self, run_id: str, status: str) -> Run:
+        """Mark a run finished. Only the status column is ever updated."""
+        if self._db.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone() is None:
+            raise ValueError(f"unknown run_id: {run_id!r}")
+        self._db.execute("UPDATE runs SET status = ? WHERE id = ?", (status, run_id))
+        self._db.commit()
+        return self.get_run(run_id)
+
     def append_event(
         self,
         run_id: str,
