@@ -24,6 +24,8 @@ class Settings(BaseModel):
     email_allowlist: list[str] = Field(default_factory=lambda: ["example.com"])
     max_tool_calls: int = 10
     db_path: str = "agentledger.db"
+    model_api_base: str = "https://model-api.example/v1"
+    model_timeout: int = 30
 
 
 class Roles(BaseModel):

@@ -231,3 +231,56 @@ def test_finish_run_rejects_unknown_run(store):
         store.finish_run("missing", "completed")
     with pytest.raises(ValueError, match="unknown run_id"):
         store.get_run("missing")
+
+
+class RecordingAgent:
+    """Scripted agent that also records the outcomes the pipeline reports."""
+
+    name = "recording"
+
+    def __init__(self, actions):
+        self._agent = ScriptedAgent(actions)
+        self.observed = []
+
+    def propose(self):
+        return self._agent.propose()
+
+    def observe(self, action, outcome):
+        self.observed.append((action, outcome))
+
+
+def test_pipeline_reports_executed_and_failed_outcomes(store, ctx):
+    agent = RecordingAgent(
+        [
+            {"tool": "lookup_record", "args": {"record_id": "rec-001"}},
+            {"tool": "read_document", "args": {"document_id": "nope"}},
+        ]
+    )
+    run_agent("test task", "operator", agent, store, ctx)
+
+    assert [(a.tool, o["status"]) for a, o in agent.observed] == [
+        ("lookup_record", "executed"),
+        ("read_document", "failed"),
+    ]
+    assert agent.observed[0][1]["result"]["record"]["id"] == "rec-001"
+    assert "unknown document_id" in agent.observed[1][1]["error"]
+
+
+def test_pipeline_reports_blocked_outcome(store, ctx):
+    agent = RecordingAgent(
+        [{"tool": "send_email", "args": {"to": "a", "subject": "s", "body": "b"}}]
+    )
+    run_agent("test task", "reader", agent, store, ctx, policy=BlockPolicy())
+
+    assert [(a.tool, o["status"]) for a, o in agent.observed] == [("send_email", "blocked")]
+    assert agent.observed[0][1]["reason"] == "test block"
+
+
+def test_pipeline_reports_denied_outcome(store, ctx):
+    agent = RecordingAgent(
+        [{"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}}]
+    )
+    run_agent("test task", "operator", agent, store, ctx, approval=DenyApproval())
+
+    assert [(a.tool, o["status"]) for a, o in agent.observed] == [("update_status", "denied")]
+    assert agent.observed[0][1]["decider"] == "test-human"

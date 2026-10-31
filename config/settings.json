@@ -3,5 +3,7 @@
   "guardian_model": "muse-spark",
   "email_allowlist": ["example.com"],
   "max_tool_calls": 10,
-  "db_path": "agentledger.db"
+  "db_path": "agentledger.db",
+  "model_api_base": "https://model-api.example/v1",
+  "model_timeout": 30
 }

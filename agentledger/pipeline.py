@@ -13,13 +13,16 @@ Steps 5 and 6 replace the stub gates (:class:`AllowAllPolicy`,
 :class:`AllowAllGuardian`, :class:`AutoApprove`) with the real policy
 engine, guardian model, and human approval. The pipeline logs
 ``model_call`` + ``action_proposed`` for every proposal and finishes with
-``run_finished``.
+``run_finished``. After each action the pipeline also reports the outcome
+back through an optional ``observe(action, outcome)`` method, so model
+agents can react to results; agents without it (like the scripted one)
+are unaffected.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel
 
@@ -91,6 +94,13 @@ def _risk_of(tool_name: str) -> str:
     return spec.risk if spec else "high"
 
 
+def _notify(agent: BaseAgent, action: ProposedAction, outcome: dict[str, Any]) -> None:
+    """Report an action's outcome back to agents that accept observations."""
+    observe = getattr(agent, "observe", None)
+    if callable(observe):
+        observe(action, outcome)
+
+
 def run_agent(
     task: str,
     agent_role: str,
@@ -144,6 +154,7 @@ def run_agent(
                 "policy",
                 {"step": steps, "tool": action.tool, "reason": decision.reason},
             )
+            _notify(agent, action, {"status": "blocked", "reason": decision.reason})
             continue
 
         if _risk_of(action.tool) == "high":
@@ -161,6 +172,7 @@ def run_agent(
                     "policy",
                     {"step": steps, "tool": action.tool, "reason": f"guardian blocked: {verdict.reason}"},
                 )
+                _notify(agent, action, {"status": "blocked", "reason": f"guardian blocked: {verdict.reason}"})
                 continue
             store.append_event(
                 run.id,
@@ -176,6 +188,7 @@ def run_agent(
                 {"step": steps, "tool": action.tool, "approved": approval_decision.approved},
             )
             if not approval_decision.approved:
+                _notify(agent, action, {"status": "denied", "decider": approval_decision.decider})
                 continue
 
         try:
@@ -186,11 +199,13 @@ def run_agent(
             store.append_event(
                 run.id, EventType.TOOL_FAILED, "tool", {"step": steps, "tool": action.tool, "error": str(e)}
             )
+            _notify(agent, action, {"status": "failed", "error": str(e)})
             continue
         tool_calls += 1
         store.append_event(
             run.id, EventType.TOOL_EXECUTED, "tool", {"step": steps, "tool": action.tool, "result": result}
         )
+        _notify(agent, action, {"status": "executed", "result": result})
 
     store.finish_run(run.id, status)
     store.append_event(
