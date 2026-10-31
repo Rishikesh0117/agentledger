@@ -9,18 +9,22 @@ import json
 import urllib.error
 
 import pytest
+from pydantic import ValidationError
 
 from agentledger import (
     API_KEY_ENV_VAR,
     FINISH_TOOL,
     ChatResult,
+    LedgerStore,
     ModelAgent,
     ModelClient,
     ModelError,
     Settings,
     ToolCall,
+    default_context,
     extract_json,
     load_settings,
+    run_agent,
 )
 
 
@@ -128,20 +132,22 @@ def test_missing_api_key_raises_before_http(monkeypatch):
         ModelClient(model="m", api_key="", api_base="https://api.test/v1")
 
 
+def _required_settings(**overrides):
+    values = {"agent_model": "a", "guardian_model": "g", "model_api_base": "https://b.test"}
+    values.update(overrides)
+    return Settings(**values)
+
+
 def test_from_settings_reads_key_from_env(monkeypatch):
     monkeypatch.setenv(API_KEY_ENV_VAR, "env-key")
-    client = ModelClient.from_settings(Settings())
-    assert (client.model, client._api_base, client.timeout) == (
-        "muse-spark",
-        "https://model-api.example/v1",
-        30,
-    )
+    client = ModelClient.from_settings(_required_settings())
+    assert (client.model, client._api_base, client.timeout) == ("a", "https://b.test", 30)
 
 
 def test_from_settings_without_key_raises(monkeypatch):
     monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
     with pytest.raises(ModelError, match="META_MODEL_API_KEY"):
-        ModelClient.from_settings(Settings())
+        ModelClient.from_settings(_required_settings())
 
 
 def test_http_error_raises_model_error(monkeypatch):
@@ -280,13 +286,98 @@ def test_agent_name_defaults_to_model():
     assert _agent(FakeClient([]), name="custom").name == "custom"
 
 
-def test_settings_carry_model_connection_defaults():
-    settings = Settings()
-    assert settings.model_api_base == "https://model-api.example/v1"
-    assert settings.model_timeout == 30
+def test_settings_requires_model_name_and_base_url():
+    with pytest.raises(ValidationError) as exc_info:
+        Settings()
+    missing = {".".join(map(str, err["loc"])) for err in exc_info.value.errors()}
+    assert {"agent_model", "guardian_model", "model_api_base"} <= missing
 
 
 def test_shipped_settings_load_model_connection():
     settings = load_settings("config/settings.json", dotenv_path=None)
-    assert settings.model_api_base == "https://model-api.example/v1"
+    assert settings.model_api_base == "https://api.meta.ai/v1"
     assert settings.model_timeout == 30
+
+
+@pytest.fixture
+def store(tmp_path):
+    with LedgerStore(tmp_path / "test.db") as s:
+        yield s
+
+
+@pytest.fixture
+def ctx():
+    return default_context()
+
+
+def test_load_settings_custom_values_used_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setenv(API_KEY_ENV_VAR, "env-key")
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "agent_model": "custom-agent",
+                "guardian_model": "custom-guardian",
+                "model_api_base": "https://custom.test/v2",
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = ModelClient.from_settings(load_settings(str(path), dotenv_path=None))
+    assert (client.model, client._api_base) == ("custom-agent", "https://custom.test/v2")
+
+
+def test_from_settings_uses_configured_values(monkeypatch):
+    monkeypatch.setenv(API_KEY_ENV_VAR, "env-key")
+    settings = _required_settings(agent_model="custom-model", model_api_base="https://custom.test/v2")
+    client = ModelClient.from_settings(settings)
+    assert (client.model, client._api_base) == ("custom-model", "https://custom.test/v2")
+
+
+def test_pipeline_model_call_uses_configured_model_name(store, ctx):
+    client = FakeClient(
+        [
+            ChatResult(content='{"tool": "lookup_record", "args": {"record_id": "rec-001"}}'),
+            ChatResult(content=json.dumps({"tool": FINISH_TOOL, "args": {}})),
+        ]
+    )
+    client.model = "custom-configured-model"
+    result = run_agent("t", "operator", _agent(client), store, ctx)
+
+    calls = [e for e in store.list_events(result.run.id) if e.event_type.value == "model_call"]
+    assert [c.payload["model"] for c in calls] == ["custom-configured-model"] * 2
+
+
+def test_finish_call_recorded_as_model_call(store, ctx):
+    client = FakeClient(
+        [
+            ChatResult(content='{"tool": "lookup_record", "args": {"record_id": "rec-001"}}'),
+            ChatResult(content=json.dumps({"tool": FINISH_TOOL, "args": {}})),
+        ]
+    )
+    result = run_agent("t", "operator", _agent(client), store, ctx)
+
+    events = store.list_events(result.run.id)
+    assert [e.event_type.value for e in events] == [
+        "model_call",
+        "action_proposed",
+        "tool_executed",
+        "model_call",
+        "run_finished",
+    ]
+    finish_call = events[3]
+    assert finish_call.payload["finish"] is True
+    assert finish_call.payload["model"] == "fake-model"
+    assert finish_call.payload["step"] == 2
+    assert result.steps == 1
+    assert store.verify_chain().ok
+
+
+def test_model_call_includes_latency(store, ctx):
+    client = FakeClient([ChatResult(content=json.dumps({"tool": FINISH_TOOL, "args": {}}))])
+    result = run_agent("t", "operator", _agent(client), store, ctx)
+
+    calls = [e for e in store.list_events(result.run.id) if e.event_type.value == "model_call"]
+    assert len(calls) == 1
+    assert isinstance(calls[0].payload["latency_ms"], int)
+    assert calls[0].payload["latency_ms"] >= 0

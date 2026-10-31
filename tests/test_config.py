@@ -1,6 +1,7 @@
 """Config tests: settings, roles, and .env secret loading."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -24,6 +25,7 @@ def test_load_settings_full_file(tmp_path):
         {
             "agent_model": "model-a",
             "guardian_model": "model-b",
+            "model_api_base": "https://models.test/v1",
             "email_allowlist": ["acme.test"],
             "max_tool_calls": 3,
             "db_path": "custom.db",
@@ -32,23 +34,41 @@ def test_load_settings_full_file(tmp_path):
     settings = load_settings(path, dotenv_path=None)
     assert settings.agent_model == "model-a"
     assert settings.guardian_model == "model-b"
+    assert settings.model_api_base == "https://models.test/v1"
     assert settings.email_allowlist == ["acme.test"]
     assert settings.max_tool_calls == 3
     assert settings.db_path == "custom.db"
 
 
 def test_load_settings_partial_file_fills_defaults(tmp_path):
-    settings = load_settings(_write(tmp_path / "s.json", {"agent_model": "x"}), dotenv_path=None)
+    settings = load_settings(
+        _write(
+            tmp_path / "s.json",
+            {"agent_model": "x", "guardian_model": "y", "model_api_base": "https://z.test"},
+        ),
+        dotenv_path=None,
+    )
     assert settings.agent_model == "x"
-    assert settings.guardian_model == "muse-spark"
+    assert settings.guardian_model == "y"
+    assert settings.model_api_base == "https://z.test"
     assert settings.email_allowlist == ["example.com"]
     assert settings.max_tool_calls == 10
     assert settings.db_path == "agentledger.db"
+    assert settings.model_timeout == 30
 
 
 def test_load_settings_missing_file():
     with pytest.raises(FileNotFoundError):
         load_settings("does/not/exist.json", dotenv_path=None)
+
+
+def test_load_settings_missing_required_values_fails_clearly(tmp_path):
+    path = _write(tmp_path / "s.json", {"agent_model": "x"})
+    with pytest.raises(ValueError) as exc_info:
+        load_settings(path, dotenv_path=None)
+    message = str(exc_info.value)
+    assert "guardian_model" in message and "model_api_base" in message
+    assert "s.json" in message
 
 
 def test_shipped_roles_match_plan():
@@ -102,3 +122,12 @@ def test_dotenv_missing_file_is_fine(tmp_path, monkeypatch):
     monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
     load_dotenv(tmp_path / "nope.env")
     assert get_api_key() is None
+
+
+def test_dotenv_example_has_placeholders_only():
+    for line in Path(".env.example").read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, _, value = stripped.partition("=")
+        assert key and value == "", f".env.example must not carry values: {stripped}"

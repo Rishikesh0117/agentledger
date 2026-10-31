@@ -43,7 +43,15 @@ def parse_action_json(text: str) -> ProposedAction:
 
 
 class BaseAgent(Protocol):
-    """Anything the pipeline can pull actions from, one at a time."""
+    """Anything the pipeline can pull actions from, one at a time.
+
+    Optional extras the pipeline honors when present:
+
+    - ``observe(action, outcome)``: receives each action's outcome dict.
+    - ``empty_proposal_is_call``: when True, a ``None`` return still
+      records a ``model_call`` event, because the agent called the model
+      and the model signaled completion.
+    """
 
     name: str
 
@@ -62,7 +70,7 @@ class ScriptedAgent:
     def __init__(
         self,
         actions: list[ProposedAction | dict[str, Any] | str],
-        name: str = "scripted",
+        name: str = "scripted-fake",
     ):
         self.name = name
         self._actions: list[ProposedAction] = [self._coerce(a) for a in actions]

@@ -276,6 +276,17 @@ def test_pipeline_reports_blocked_outcome(store, ctx):
     assert agent.observed[0][1]["reason"] == "test block"
 
 
+def test_model_call_records_scripted_fake_name_and_latency(store, ctx):
+    agent = ScriptedAgent([{"tool": "lookup_record", "args": {"record_id": "rec-001"}}])
+    result = run_agent("test task", "operator", agent, store, ctx)
+
+    calls = [e for e in store.list_events(result.run.id) if e.event_type.value == "model_call"]
+    assert len(calls) == 1
+    assert calls[0].payload["model"] == "scripted-fake"
+    assert isinstance(calls[0].payload["latency_ms"], int)
+    assert calls[0].payload["latency_ms"] >= 0
+
+
 def test_pipeline_reports_denied_outcome(store, ctx):
     agent = RecordingAgent(
         [{"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}}]

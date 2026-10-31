@@ -13,7 +13,10 @@ Steps 5 and 6 replace the stub gates (:class:`AllowAllPolicy`,
 :class:`AllowAllGuardian`, :class:`AutoApprove`) with the real policy
 engine, guardian model, and human approval. The pipeline logs
 ``model_call`` + ``action_proposed`` for every proposal and finishes with
-``run_finished``. After each action the pipeline also reports the outcome
+``run_finished``. Every ``model_call`` carries the agent's model name and
+``latency_ms``. When an agent with ``empty_proposal_is_call`` set returns
+``None``, that final call is recorded as a ``model_call`` with
+``finish: true``. After each action the pipeline also reports the outcome
 back through an optional ``observe(action, outcome)`` method, so model
 agents can react to results; agents without it (like the scripted one)
 are unaffected.
@@ -21,6 +24,7 @@ are unaffected.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
@@ -115,14 +119,19 @@ def run_agent(
 ) -> RunResult:
     """Run the agent loop until the agent finishes or the step cap hits.
 
-    ``max_steps`` defaults to ``settings.max_tool_calls`` as a loop guard;
-    full loop detection (rule 5) is a stretch goal.
+    ``max_steps`` defaults to ``settings.max_tool_calls`` (10 when no
+    settings are passed) as a loop guard; full loop detection (rule 5)
+    is a stretch goal.
     """
-    settings = settings or Settings()
     policy = policy or AllowAllPolicy()
     guardian = guardian or AllowAllGuardian()
     approval = approval or AutoApprove()
-    cap = max_steps if max_steps is not None else settings.max_tool_calls
+    if max_steps is not None:
+        cap = max_steps
+    elif settings is not None:
+        cap = settings.max_tool_calls
+    else:
+        cap = 10  # matches the Settings.max_tool_calls default
 
     run = store.create_run(task=task, agent_role=agent_role)
     steps = 0
@@ -133,12 +142,26 @@ def run_agent(
         if steps >= cap:
             status = "stopped_max_steps"
             break
+        started = time.perf_counter()
         action = agent.propose()
+        latency_ms = int((time.perf_counter() - started) * 1000)
         if action is None:
+            if getattr(agent, "empty_proposal_is_call", False):
+                store.append_event(
+                    run.id,
+                    EventType.MODEL_CALL,
+                    "agent",
+                    {"step": steps + 1, "model": agent.name, "finish": True, "latency_ms": latency_ms},
+                )
             break
         steps += 1
 
-        store.append_event(run.id, EventType.MODEL_CALL, "agent", {"step": steps, "model": agent.name})
+        store.append_event(
+            run.id,
+            EventType.MODEL_CALL,
+            "agent",
+            {"step": steps, "model": agent.name, "latency_ms": latency_ms},
+        )
         store.append_event(
             run.id,
             EventType.ACTION_PROPOSED,

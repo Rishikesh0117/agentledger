@@ -22,6 +22,10 @@ def test_empty_script_finishes_immediately():
     assert ScriptedAgent([]).propose() is None
 
 
+def test_scripted_default_name_marks_it_fake():
+    assert ScriptedAgent([]).name == "scripted-fake"
+
+
 def test_accepts_dicts_and_json_strings():
     agent = ScriptedAgent(
         [

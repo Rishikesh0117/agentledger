@@ -16,8 +16,8 @@ Native tool calling is unconfirmed, so :class:`ModelAgent` supports both:
 with ``native_tools=True`` it sends tool schemas and prefers ``tool_calls``;
 otherwise (the default) it asks for one strict ``{"tool", "args"}`` JSON
 object and parses it with :func:`parse_action_json`. The model finishes a
-run by proposing the ``finish`` tool, which the agent converts to ``None``
-so the pipeline never sees it.
+run by proposing the ``finish`` tool, which the agent converts to ``None``;
+the pipeline still records that final call as a ``model_call`` event.
 """
 
 from __future__ import annotations
@@ -167,6 +167,8 @@ def _system_prompt(task: str, role: str, specs: dict[str, ToolSpec]) -> str:
 
 class ModelAgent:
     """A :class:`BaseAgent` that calls Muse Spark for every proposal."""
+
+    empty_proposal_is_call = True  # every propose() hits the model, even a "finish"
 
     def __init__(
         self,
