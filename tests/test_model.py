@@ -342,7 +342,7 @@ def test_pipeline_model_call_uses_configured_model_name(store, ctx):
         ]
     )
     client.model = "custom-configured-model"
-    result = run_agent("t", "operator", _agent(client), store, ctx)
+    result = run_agent("t", "operator", _agent(client), store, ctx, _required_settings())
 
     calls = [e for e in store.list_events(result.run.id) if e.event_type.value == "model_call"]
     assert [c.payload["model"] for c in calls] == ["custom-configured-model"] * 2
@@ -355,7 +355,7 @@ def test_finish_call_recorded_as_model_call(store, ctx):
             ChatResult(content=json.dumps({"tool": FINISH_TOOL, "args": {}})),
         ]
     )
-    result = run_agent("t", "operator", _agent(client), store, ctx)
+    result = run_agent("t", "operator", _agent(client), store, ctx, _required_settings())
 
     events = store.list_events(result.run.id)
     assert [e.event_type.value for e in events] == [
@@ -375,7 +375,7 @@ def test_finish_call_recorded_as_model_call(store, ctx):
 
 def test_model_call_includes_latency(store, ctx):
     client = FakeClient([ChatResult(content=json.dumps({"tool": FINISH_TOOL, "args": {}}))])
-    result = run_agent("t", "operator", _agent(client), store, ctx)
+    result = run_agent("t", "operator", _agent(client), store, ctx, _required_settings())
 
     calls = [e for e in store.list_events(result.run.id) if e.event_type.value == "model_call"]
     assert len(calls) == 1

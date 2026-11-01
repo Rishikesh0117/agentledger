@@ -31,14 +31,13 @@ from agentledger.model import (
 )
 from agentledger.pipeline import (
     AllowAllGuardian,
-    AllowAllPolicy,
     ApprovalDecision,
     AutoApprove,
     GuardianVerdict,
-    PolicyDecision,
     RunResult,
     run_agent,
 )
+from agentledger.policy import ROLE_TOOLS, PolicyDecision, evaluate
 from agentledger.tools import (
     TOOLS,
     ToolContext,
@@ -54,7 +53,6 @@ __all__ = [
     "GENESIS_PREV_HASH",
     "TOOLS",
     "AllowAllGuardian",
-    "AllowAllPolicy",
     "ApprovalDecision",
     "AutoApprove",
     "ChatResult",
@@ -68,6 +66,7 @@ __all__ = [
     "ModelError",
     "PolicyDecision",
     "ProposedAction",
+    "ROLE_TOOLS",
     "Roles",
     "Run",
     "RunResult",
@@ -81,6 +80,7 @@ __all__ = [
     "canonical_json",
     "compute_hash",
     "default_context",
+    "evaluate",
     "extract_json",
     "get_api_key",
     "get_tool",

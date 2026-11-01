@@ -1,21 +1,13 @@
-"""Pipeline tests: gate order, event trail, and failure handling.
+"""Pipeline tests: real policy wiring, event trail, and failure handling.
 
-Custom gate doubles stand in for the step 5 policy engine and step 6
-guardian; the pipeline must call them in PLAN.md order and skip execution
-when any gate says no.
+The policy engine (agentledger.policy) is the only policy check: tests
+use crafted roles, settings, and actions instead of policy doubles.
+High-risk actions fail closed until step 5.3 wires the approval gate.
 """
 
 import pytest
 
-from agentledger import (
-    ApprovalDecision,
-    GuardianVerdict,
-    LedgerStore,
-    PolicyDecision,
-    ScriptedAgent,
-    default_context,
-    run_agent,
-)
+from agentledger import LedgerStore, ScriptedAgent, Settings, default_context, run_agent
 
 
 @pytest.fixture
@@ -29,28 +21,14 @@ def ctx():
     return default_context()
 
 
+def _settings(**overrides):
+    values = {"agent_model": "a", "guardian_model": "g", "model_api_base": "https://b.test"}
+    values.update(overrides)
+    return Settings(**values)
+
+
 def _types(store, run_id):
     return [e.event_type.value for e in store.list_events(run_id)]
-
-
-class BlockPolicy:
-    def __call__(self, action, role):
-        return PolicyDecision(allowed=False, reason="test block")
-
-
-class BlockGuardian:
-    def __call__(self, task, action, step):
-        return GuardianVerdict(verdict="block", reason="test guardian block")
-
-
-class FlagGuardian:
-    def __call__(self, task, action, step):
-        return GuardianVerdict(verdict="flag", reason="test flag")
-
-
-class DenyApproval:
-    def __call__(self, task, action, step):
-        return ApprovalDecision(approved=False, decider="test-human")
 
 
 def test_low_risk_run_skips_guardian_and_approval(store, ctx):
@@ -60,7 +38,7 @@ def test_low_risk_run_skips_guardian_and_approval(store, ctx):
             {"tool": "draft_message", "args": {"to": "a", "subject": "s", "body": "b"}},
         ]
     )
-    result = run_agent("test task", "operator", agent, store, ctx)
+    result = run_agent("test task", "operator", agent, store, ctx, _settings())
 
     assert result.status == "completed"
     assert (result.steps, result.tool_calls) == (2, 2)
@@ -77,79 +55,51 @@ def test_low_risk_run_skips_guardian_and_approval(store, ctx):
     assert store.verify_chain().ok
 
 
-def test_high_risk_goes_through_guardian_and_approval(store, ctx):
-    agent = ScriptedAgent([{"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}}])
-    result = run_agent("test task", "operator", agent, store, ctx)
+def test_high_risk_never_executes_without_approval_gate(store, ctx):
+    agent = ScriptedAgent(
+        [{"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}}]
+    )
+    result = run_agent("test task", "operator", agent, store, ctx, _settings())
 
     assert result.status == "completed"
-    assert _types(store, result.run.id) == [
-        "model_call",
-        "action_proposed",
-        "guardian_verdict",
-        "approval_requested",
-        "approval_decision",
-        "tool_executed",
-        "run_finished",
-    ]
-    assert ctx.records["rec-001"]["status"] == "closed"
+    assert (result.steps, result.tool_calls) == (1, 0)
+    assert _types(store, result.run.id) == ["model_call", "action_proposed", "run_finished"]
+    assert ctx.records["rec-001"]["status"] == "open"
     assert store.verify_chain().ok
 
 
-def test_policy_block_skips_execution(store, ctx):
+def test_role_denied_logs_policy_blocked(store, ctx):
     agent = ScriptedAgent([{"tool": "send_email", "args": {"to": "a", "subject": "s", "body": "b"}}])
-    result = run_agent("test task", "reader", agent, store, ctx, policy=BlockPolicy())
+    result = run_agent("test task", "reader", agent, store, ctx, _settings())
 
     assert result.status == "completed"
     assert (result.steps, result.tool_calls) == (1, 0)
     assert _types(store, result.run.id) == ["model_call", "action_proposed", "policy_blocked", "run_finished"]
+    blocked = [e for e in store.list_events(result.run.id) if e.event_type.value == "policy_blocked"]
+    assert blocked[0].payload == {
+        "step": 1,
+        "tool": "send_email",
+        "args": {"to": "a", "subject": "s", "body": "b"},
+        "rule": "role_denied",
+        "reason": "tool 'send_email' is not allowed for role 'reader'",
+        "role": "reader",
+    }
     assert ctx.outbox == []
     assert store.verify_chain().ok
 
 
-def test_guardian_block_skips_approval_and_execution(store, ctx):
+def test_bad_domain_logs_policy_blocked(store, ctx):
     agent = ScriptedAgent(
-        [{"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}}]
+        [{"tool": "send_email", "args": {"to": "u@evil.test", "subject": "s", "body": "b"}}]
     )
-    result = run_agent("test task", "operator", agent, store, ctx, guardian=BlockGuardian())
+    result = run_agent("test task", "operator", agent, store, ctx, _settings())
 
     assert (result.steps, result.tool_calls) == (1, 0)
-    events = _types(store, result.run.id)
-    assert events == [
-        "model_call",
-        "action_proposed",
-        "guardian_verdict",
-        "policy_blocked",
-        "run_finished",
-    ]
-    assert "approval_requested" not in events
-    assert ctx.records["rec-001"]["status"] == "open"
+    blocked = [e for e in store.list_events(result.run.id) if e.event_type.value == "policy_blocked"]
+    assert blocked[0].payload["rule"] == "email_domain"
+    assert blocked[0].payload["role"] == "operator"
+    assert ctx.outbox == []
     assert store.verify_chain().ok
-
-
-def test_guardian_flag_still_requires_approval_then_executes(store, ctx):
-    agent = ScriptedAgent(
-        [{"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}}]
-    )
-    result = run_agent("test task", "operator", agent, store, ctx, guardian=FlagGuardian())
-
-    assert result.tool_calls == 1
-    assert "approval_requested" in _types(store, result.run.id)
-    assert ctx.records["rec-001"]["status"] == "closed"
-
-
-def test_approval_deny_skips_execution(store, ctx):
-    agent = ScriptedAgent(
-        [{"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}}]
-    )
-    result = run_agent("test task", "operator", agent, store, ctx, approval=DenyApproval())
-
-    assert (result.steps, result.tool_calls) == (1, 0)
-    events = store.list_events(result.run.id)
-    decisions = [e for e in events if e.event_type.value == "approval_decision"]
-    assert len(decisions) == 1
-    assert decisions[0].payload == {"step": 1, "tool": "update_status", "approved": False}
-    assert decisions[0].actor == "test-human"
-    assert ctx.records["rec-001"]["status"] == "open"
 
 
 def test_tool_failure_logged_and_run_continues(store, ctx):
@@ -159,7 +109,7 @@ def test_tool_failure_logged_and_run_continues(store, ctx):
             {"tool": "lookup_record", "args": {"record_id": "rec-001"}},
         ]
     )
-    result = run_agent("test task", "operator", agent, store, ctx)
+    result = run_agent("test task", "operator", agent, store, ctx, _settings())
 
     assert result.status == "completed"
     assert (result.steps, result.tool_calls) == (2, 2)
@@ -177,25 +127,27 @@ def test_tool_failure_logged_and_run_continues(store, ctx):
 
 def test_bad_tool_args_logged_as_failure(store, ctx):
     agent = ScriptedAgent([{"tool": "read_document", "args": {}}])
-    result = run_agent("test task", "operator", agent, store, ctx)
+    result = run_agent("test task", "operator", agent, store, ctx, _settings())
 
     assert (result.steps, result.tool_calls) == (1, 1)
     assert "tool_failed" in _types(store, result.run.id)
     assert store.verify_chain().ok
 
 
-def test_unknown_tool_fails_safely(store, ctx):
+def test_unknown_tool_blocked_by_policy(store, ctx):
     agent = ScriptedAgent([{"tool": "delete_everything", "args": {}}])
-    result = run_agent("test task", "operator", agent, store, ctx)
+    result = run_agent("test task", "operator", agent, store, ctx, _settings())
 
     assert result.status == "completed"
-    assert "tool_failed" in _types(store, result.run.id)
+    assert _types(store, result.run.id) == ["model_call", "action_proposed", "policy_blocked", "run_finished"]
+    blocked = [e for e in store.list_events(result.run.id) if e.event_type.value == "policy_blocked"]
+    assert blocked[0].payload["rule"] == "unknown_tool"
     assert "tool_executed" not in _types(store, result.run.id)
     assert store.verify_chain().ok
 
 
 def test_empty_script_finishes_with_zero_steps(store, ctx):
-    result = run_agent("test task", "operator", ScriptedAgent([]), store, ctx)
+    result = run_agent("test task", "operator", ScriptedAgent([]), store, ctx, _settings())
 
     assert result.status == "completed"
     assert (result.steps, result.tool_calls) == (0, 0)
@@ -210,7 +162,7 @@ def test_max_steps_stops_long_script(store, ctx):
             {"tool": "lookup_record", "args": {"record_id": "rec-001"}},
         ]
     )
-    result = run_agent("test task", "operator", agent, store, ctx, max_steps=2)
+    result = run_agent("test task", "operator", agent, store, ctx, _settings(), max_steps=2)
 
     assert result.status == "stopped_max_steps"
     assert (result.steps, result.tool_calls) == (2, 2)
@@ -220,7 +172,7 @@ def test_max_steps_stops_long_script(store, ctx):
 
 def test_run_status_updated_in_db(store, ctx):
     agent = ScriptedAgent([{"tool": "lookup_record", "args": {"record_id": "rec-001"}}])
-    result = run_agent("test task", "operator", agent, store, ctx)
+    result = run_agent("test task", "operator", agent, store, ctx, _settings())
 
     assert result.run.status == "completed"
     assert store.get_run(result.run.id).status == "completed"
@@ -256,7 +208,7 @@ def test_pipeline_reports_executed_and_failed_outcomes(store, ctx):
             {"tool": "read_document", "args": {"document_id": "nope"}},
         ]
     )
-    run_agent("test task", "operator", agent, store, ctx)
+    run_agent("test task", "operator", agent, store, ctx, _settings())
 
     assert [(a.tool, o["status"]) for a, o in agent.observed] == [
         ("lookup_record", "executed"),
@@ -270,28 +222,29 @@ def test_pipeline_reports_blocked_outcome(store, ctx):
     agent = RecordingAgent(
         [{"tool": "send_email", "args": {"to": "a", "subject": "s", "body": "b"}}]
     )
-    run_agent("test task", "reader", agent, store, ctx, policy=BlockPolicy())
+    run_agent("test task", "reader", agent, store, ctx, _settings())
 
     assert [(a.tool, o["status"]) for a, o in agent.observed] == [("send_email", "blocked")]
-    assert agent.observed[0][1]["reason"] == "test block"
+    assert agent.observed[0][1]["rule"] == "role_denied"
+    assert "reader" in agent.observed[0][1]["reason"]
+
+
+def test_pipeline_reports_needs_approval_outcome(store, ctx):
+    agent = RecordingAgent(
+        [{"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}}]
+    )
+    run_agent("test task", "operator", agent, store, ctx, _settings())
+
+    assert [(a.tool, o["status"]) for a, o in agent.observed] == [("update_status", "needs_approval")]
+    assert agent.observed[0][1]["rule"] == "high_risk"
 
 
 def test_model_call_records_scripted_fake_name_and_latency(store, ctx):
     agent = ScriptedAgent([{"tool": "lookup_record", "args": {"record_id": "rec-001"}}])
-    result = run_agent("test task", "operator", agent, store, ctx)
+    result = run_agent("test task", "operator", agent, store, ctx, _settings())
 
     calls = [e for e in store.list_events(result.run.id) if e.event_type.value == "model_call"]
     assert len(calls) == 1
     assert calls[0].payload["model"] == "scripted-fake"
     assert isinstance(calls[0].payload["latency_ms"], int)
     assert calls[0].payload["latency_ms"] >= 0
-
-
-def test_pipeline_reports_denied_outcome(store, ctx):
-    agent = RecordingAgent(
-        [{"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}}]
-    )
-    run_agent("test task", "operator", agent, store, ctx, approval=DenyApproval())
-
-    assert [(a.tool, o["status"]) for a, o in agent.observed] == [("update_status", "denied")]
-    assert agent.observed[0][1]["decider"] == "test-human"

@@ -1,25 +1,22 @@
-"""Wrapper pipeline: every proposed action passes all gates before execution.
+"""Wrapper pipeline: every proposed action passes the policy check first.
 
-Order per action (from PLAN.md):
+Order per action:
 
-1. policy check -> ``policy_blocked`` + skip when blocked
-2. guardian review (high-risk tools only) -> ``guardian_verdict``; a
-   ``block`` verdict also writes ``policy_blocked`` and skips
-3. approval gate (high-risk tools only) -> ``approval_requested`` and
-   ``approval_decision``; a denial skips
-4. tool execution -> ``tool_executed`` or ``tool_failed``
+1. policy check (agentledger.policy, the only policy check)
+   - ``block`` -> ``policy_blocked`` + skip, outcome reported to the agent
+   - ``require_approval`` -> fail closed + skip until step 5.3 wires the
+     human approval gate
+   - ``allow`` -> execute the tool
+2. tool execution -> ``tool_executed`` or ``tool_failed``
 
-Steps 5 and 6 replace the stub gates (:class:`AllowAllPolicy`,
-:class:`AllowAllGuardian`, :class:`AutoApprove`) with the real policy
-engine, guardian model, and human approval. The pipeline logs
-``model_call`` + ``action_proposed`` for every proposal and finishes with
-``run_finished``. Every ``model_call`` carries the agent's model name and
-``latency_ms``. When an agent with ``empty_proposal_is_call`` set returns
-``None``, that final call is recorded as a ``model_call`` with
-``finish: true``. After each action the pipeline also reports the outcome
-back through an optional ``observe(action, outcome)`` method, so model
-agents can react to results; agents without it (like the scripted one)
-are unaffected.
+The pipeline logs ``model_call`` + ``action_proposed`` for every proposal
+and finishes with ``run_finished``. Every ``model_call`` carries the
+agent's model name and ``latency_ms``. When an agent with
+``empty_proposal_is_call`` set returns ``None``, that final call is
+recorded as a ``model_call`` with ``finish: true``. After each action the
+pipeline also reports the outcome back through an optional
+``observe(action, outcome)`` method, so model agents can react to
+results; agents without it (like the scripted one) are unaffected.
 """
 
 from __future__ import annotations
@@ -33,12 +30,8 @@ from pydantic import BaseModel
 from agentledger.agent import BaseAgent, ProposedAction
 from agentledger.config import Settings
 from agentledger.ledger import EventType, LedgerStore, Run
-from agentledger.tools import TOOLS, ToolContext, ToolError, run_tool
-
-
-class PolicyDecision(BaseModel):
-    allowed: bool
-    reason: str = ""
+from agentledger.policy import evaluate
+from agentledger.tools import ToolContext, ToolError, run_tool
 
 
 class GuardianVerdict(BaseModel):
@@ -51,23 +44,12 @@ class ApprovalDecision(BaseModel):
     decider: str = "auto-approve-stub"
 
 
-class PolicyCheck(Protocol):
-    def __call__(self, action: ProposedAction, role: str) -> PolicyDecision: ...
-
-
 class GuardianReview(Protocol):
     def __call__(self, task: str, action: ProposedAction, step: int) -> GuardianVerdict: ...
 
 
 class ApprovalGate(Protocol):
     def __call__(self, task: str, action: ProposedAction, step: int) -> ApprovalDecision: ...
-
-
-class AllowAllPolicy:
-    """Step 3 stub: allow everything. Step 5 implements the real rules."""
-
-    def __call__(self, action: ProposedAction, role: str) -> PolicyDecision:
-        return PolicyDecision(allowed=True)
 
 
 class AllowAllGuardian:
@@ -92,12 +74,6 @@ class RunResult:
     status: str
 
 
-def _risk_of(tool_name: str) -> str:
-    """Risk level for gating. Unknown tools fail closed as high-risk."""
-    spec = TOOLS.get(tool_name)
-    return spec.risk if spec else "high"
-
-
 def _notify(agent: BaseAgent, action: ProposedAction, outcome: dict[str, Any]) -> None:
     """Report an action's outcome back to agents that accept observations."""
     observe = getattr(agent, "observe", None)
@@ -111,27 +87,25 @@ def run_agent(
     agent: BaseAgent,
     store: LedgerStore,
     ctx: ToolContext,
-    settings: Settings | None = None,
-    policy: PolicyCheck | None = None,
+    settings: Settings,
     guardian: GuardianReview | None = None,
     approval: ApprovalGate | None = None,
     max_steps: int | None = None,
 ) -> RunResult:
     """Run the agent loop until the agent finishes or the step cap hits.
 
-    ``max_steps`` defaults to ``settings.max_tool_calls`` (10 when no
-    settings are passed) as a loop guard; full loop detection (rule 5)
-    is a stretch goal.
+    ``settings`` is required: the policy check needs the email
+    allowlist and the loop cap. ``max_steps`` defaults to
+    ``settings.max_tool_calls`` as a loop guard; full loop detection
+    (rule 5) is a stretch goal.
+
+    ``guardian`` and ``approval`` are seams for steps 5.3 and 6 and are
+    not consulted yet: ``require_approval`` outcomes fail closed.
     """
-    policy = policy or AllowAllPolicy()
-    guardian = guardian or AllowAllGuardian()
-    approval = approval or AutoApprove()
     if max_steps is not None:
         cap = max_steps
-    elif settings is not None:
-        cap = settings.max_tool_calls
     else:
-        cap = 10  # matches the Settings.max_tool_calls default
+        cap = settings.max_tool_calls
 
     run = store.create_run(task=task, agent_role=agent_role)
     steps = 0
@@ -169,50 +143,28 @@ def run_agent(
             {"step": steps, "tool": action.tool, "args": action.args},
         )
 
-        decision = policy(action, agent_role)
-        if not decision.allowed:
+        decision = evaluate(action, agent_role, settings, tool_calls)
+        if decision.outcome == "block":
             store.append_event(
                 run.id,
                 EventType.POLICY_BLOCKED,
                 "policy",
-                {"step": steps, "tool": action.tool, "reason": decision.reason},
+                {
+                    "step": steps,
+                    "tool": action.tool,
+                    "args": action.args,
+                    "rule": decision.rule,
+                    "reason": decision.reason,
+                    "role": agent_role,
+                },
             )
-            _notify(agent, action, {"status": "blocked", "reason": decision.reason})
+            _notify(agent, action, {"status": "blocked", "reason": decision.reason, "rule": decision.rule})
             continue
-
-        if _risk_of(action.tool) == "high":
-            verdict = guardian(task, action, steps)
-            store.append_event(
-                run.id,
-                EventType.GUARDIAN_VERDICT,
-                "guardian",
-                {"step": steps, "tool": action.tool, "verdict": verdict.verdict, "reason": verdict.reason},
-            )
-            if verdict.verdict == "block":
-                store.append_event(
-                    run.id,
-                    EventType.POLICY_BLOCKED,
-                    "policy",
-                    {"step": steps, "tool": action.tool, "reason": f"guardian blocked: {verdict.reason}"},
-                )
-                _notify(agent, action, {"status": "blocked", "reason": f"guardian blocked: {verdict.reason}"})
-                continue
-            store.append_event(
-                run.id,
-                EventType.APPROVAL_REQUESTED,
-                "approval",
-                {"step": steps, "tool": action.tool, "args": action.args},
-            )
-            approval_decision = approval(task, action, steps)
-            store.append_event(
-                run.id,
-                EventType.APPROVAL_DECISION,
-                approval_decision.decider,
-                {"step": steps, "tool": action.tool, "approved": approval_decision.approved},
-            )
-            if not approval_decision.approved:
-                _notify(agent, action, {"status": "denied", "decider": approval_decision.decider})
-                continue
+        if decision.outcome == "require_approval":
+            # Step 5.3 seam: consult the human approval gate here and
+            # execute only when approved. Until then, fail closed.
+            _notify(agent, action, {"status": "needs_approval", "reason": decision.reason, "rule": decision.rule})
+            continue
 
         try:
             result = run_tool(action.tool, action.args, ctx)
