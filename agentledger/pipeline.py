@@ -4,8 +4,9 @@ Order per action:
 
 1. policy check (agentledger.policy, the only policy check)
    - ``block`` -> ``policy_blocked`` + skip, outcome reported to the agent
-   - ``require_approval`` -> fail closed + skip until step 5.3 wires the
-     human approval gate
+   - ``require_approval`` -> ``approval_requested``, consult the
+     approval gate, log ``approval_decision`` either way, execute only
+     on approve
    - ``allow`` -> execute the tool
 2. tool execution -> ``tool_executed`` or ``tool_failed``
 
@@ -60,10 +61,17 @@ class AllowAllGuardian:
 
 
 class AutoApprove:
-    """Step 3 stub: approve everything. Later this waits for a human."""
+    """Approve everything. Explicit opt-in for scripts and tests only."""
 
     def __call__(self, task: str, action: ProposedAction, step: int) -> ApprovalDecision:
         return ApprovalDecision(approved=True)
+
+
+class AutoDeny:
+    """Default gate: deny everything when no human is wired up (fail closed)."""
+
+    def __call__(self, task: str, action: ProposedAction, step: int) -> ApprovalDecision:
+        return ApprovalDecision(approved=False, decider="auto-deny")
 
 
 @dataclass
@@ -99,9 +107,11 @@ def run_agent(
     ``settings.max_tool_calls`` as a loop guard; full loop detection
     (rule 5) is a stretch goal.
 
-    ``guardian`` and ``approval`` are seams for steps 5.3 and 6 and are
-    not consulted yet: ``require_approval`` outcomes fail closed.
+    ``approval`` decides ``require_approval`` outcomes and defaults to
+    denying everything; pass a human-backed gate to approve.
+    ``guardian`` is still a seam for step 6 and is not consulted yet.
     """
+    approval = approval or AutoDeny()
     if max_steps is not None:
         cap = max_steps
     else:
@@ -161,10 +171,28 @@ def run_agent(
             _notify(agent, action, {"status": "blocked", "reason": decision.reason, "rule": decision.rule})
             continue
         if decision.outcome == "require_approval":
-            # Step 5.3 seam: consult the human approval gate here and
-            # execute only when approved. Until then, fail closed.
-            _notify(agent, action, {"status": "needs_approval", "reason": decision.reason, "rule": decision.rule})
-            continue
+            store.append_event(
+                run.id,
+                EventType.APPROVAL_REQUESTED,
+                "approval",
+                {
+                    "step": steps,
+                    "tool": action.tool,
+                    "args": action.args,
+                    "rule": decision.rule,
+                    "reason": decision.reason,
+                },
+            )
+            approval_decision = approval(task, action, steps)
+            store.append_event(
+                run.id,
+                EventType.APPROVAL_DECISION,
+                approval_decision.decider,
+                {"step": steps, "tool": action.tool, "approved": approval_decision.approved},
+            )
+            if not approval_decision.approved:
+                _notify(agent, action, {"status": "denied", "decider": approval_decision.decider})
+                continue
 
         try:
             result = run_tool(action.tool, action.args, ctx)

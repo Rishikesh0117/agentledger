@@ -7,7 +7,16 @@ High-risk actions fail closed until step 5.3 wires the approval gate.
 
 import pytest
 
-from agentledger import LedgerStore, ScriptedAgent, Settings, default_context, run_agent
+from agentledger import (
+    ApprovalDecision,
+    AutoApprove,
+    AutoDeny,
+    LedgerStore,
+    ScriptedAgent,
+    Settings,
+    default_context,
+    run_agent,
+)
 
 
 @pytest.fixture
@@ -55,7 +64,7 @@ def test_low_risk_run_skips_guardian_and_approval(store, ctx):
     assert store.verify_chain().ok
 
 
-def test_high_risk_never_executes_without_approval_gate(store, ctx):
+def test_high_risk_denied_by_default_without_gate(store, ctx):
     agent = ScriptedAgent(
         [{"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}}]
     )
@@ -63,9 +72,71 @@ def test_high_risk_never_executes_without_approval_gate(store, ctx):
 
     assert result.status == "completed"
     assert (result.steps, result.tool_calls) == (1, 0)
-    assert _types(store, result.run.id) == ["model_call", "action_proposed", "run_finished"]
+    assert _types(store, result.run.id) == [
+        "model_call",
+        "action_proposed",
+        "approval_requested",
+        "approval_decision",
+        "run_finished",
+    ]
+    events = store.list_events(result.run.id)
+    decision = [e for e in events if e.event_type.value == "approval_decision"][0]
+    assert decision.actor == "auto-deny"
+    assert decision.payload == {"step": 1, "tool": "update_status", "approved": False}
     assert ctx.records["rec-001"]["status"] == "open"
     assert store.verify_chain().ok
+
+
+def test_approved_high_risk_executes(store, ctx):
+    agent = ScriptedAgent(
+        [{"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}}]
+    )
+    result = run_agent("test task", "operator", agent, store, ctx, _settings(), approval=AutoApprove())
+
+    assert (result.steps, result.tool_calls) == (1, 1)
+    assert _types(store, result.run.id) == [
+        "model_call",
+        "action_proposed",
+        "approval_requested",
+        "approval_decision",
+        "tool_executed",
+        "run_finished",
+    ]
+    assert ctx.records["rec-001"]["status"] == "closed"
+    assert store.verify_chain().ok
+
+
+class DenyApproval:
+    def __call__(self, task, action, step):
+        return ApprovalDecision(approved=False, decider="test-human")
+
+
+def test_denied_high_risk_skips_execution_but_logs_decision(store, ctx):
+    agent = ScriptedAgent(
+        [{"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}}]
+    )
+    result = run_agent("test task", "operator", agent, store, ctx, _settings(), approval=DenyApproval())
+
+    assert (result.steps, result.tool_calls) == (1, 0)
+    events = store.list_events(result.run.id)
+    requested = [e for e in events if e.event_type.value == "approval_requested"][0]
+    assert requested.payload == {
+        "step": 1,
+        "tool": "update_status",
+        "args": {"record_id": "rec-001", "status": "closed"},
+        "rule": "high_risk",
+        "reason": "'update_status' is high-risk and needs human approval",
+    }
+    decision = [e for e in events if e.event_type.value == "approval_decision"][0]
+    assert decision.actor == "test-human"
+    assert decision.payload["approved"] is False
+    assert ctx.records["rec-001"]["status"] == "open"
+    assert store.verify_chain().ok
+
+
+def test_auto_deny_denies_everything():
+    decision = AutoDeny()("task", None, 1)
+    assert (decision.approved, decision.decider) == (False, "auto-deny")
 
 
 def test_role_denied_logs_policy_blocked(store, ctx):
@@ -229,14 +300,14 @@ def test_pipeline_reports_blocked_outcome(store, ctx):
     assert "reader" in agent.observed[0][1]["reason"]
 
 
-def test_pipeline_reports_needs_approval_outcome(store, ctx):
+def test_pipeline_reports_denied_outcome(store, ctx):
     agent = RecordingAgent(
         [{"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}}]
     )
-    run_agent("test task", "operator", agent, store, ctx, _settings())
+    run_agent("test task", "operator", agent, store, ctx, _settings(), approval=DenyApproval())
 
-    assert [(a.tool, o["status"]) for a, o in agent.observed] == [("update_status", "needs_approval")]
-    assert agent.observed[0][1]["rule"] == "high_risk"
+    assert [(a.tool, o["status"]) for a, o in agent.observed] == [("update_status", "denied")]
+    assert agent.observed[0][1]["decider"] == "test-human"
 
 
 def test_model_call_records_scripted_fake_name_and_latency(store, ctx):
