@@ -29,7 +29,12 @@ from agentledger.model import (
     ToolCall,
     extract_json,
 )
-from agentledger.guardian import AllowAllGuardian, FakeGuardian, GuardianVerdict
+from agentledger.guardian import (
+    AllowAllGuardian,
+    FakeGuardian,
+    GuardianVerdict,
+    ModelGuardian,
+)
 from agentledger.pipeline import (
     ApprovalDecision,
     AutoApprove,
@@ -66,6 +71,7 @@ __all__ = [
     "ModelAgent",
     "ModelClient",
     "ModelError",
+    "ModelGuardian",
     "PolicyDecision",
     "ProposedAction",
     "ROLE_TOOLS",

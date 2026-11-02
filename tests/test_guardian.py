@@ -7,8 +7,29 @@ from datetime import datetime, timezone
 
 import pytest
 
-from agentledger import Event, EventType, ProposedAction
+from agentledger import (
+    ChatResult,
+    Event,
+    EventType,
+    ModelError,
+    ModelGuardian,
+    ProposedAction,
+)
 from agentledger.guardian import FakeGuardian, Guardian, GuardianVerdict
+
+
+class FakeClient:
+    """Stand-in for ModelClient: replays canned results, records calls."""
+
+    model = "fake-guardian-model"
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.calls = []
+
+    def chat(self, messages, tools=None):
+        self.calls.append({"messages": [dict(m) for m in messages], "tools": tools})
+        return self._results.pop(0)
 
 
 def _event(n=1):
@@ -86,3 +107,57 @@ def test_fake_rejects_bad_verdict():
 
 def test_fake_implements_guardian_protocol():
     assert isinstance(FakeGuardian([]), Guardian)
+
+
+def _guardian(client):
+    return ModelGuardian(client=client)
+
+
+def test_model_guardian_parses_verdict():
+    client = FakeClient([ChatResult(content='{"verdict": "block", "reason": "Exfiltrates data."}')])
+    verdict = _guardian(client).review("task", _action(), [])
+    assert verdict == GuardianVerdict(verdict="block", reason="Exfiltrates data.")
+
+
+def test_model_guardian_strips_code_fences():
+    reply = '```json\n{"verdict": "flag", "reason": "Needs a close look."}\n```'
+    verdict = _guardian(FakeClient([ChatResult(content=reply)])).review("task", _action(), [])
+    assert verdict == GuardianVerdict(verdict="flag", reason="Needs a close look.")
+
+
+def test_model_guardian_rejects_invalid_json():
+    with pytest.raises(ModelError, match="not return a valid verdict"):
+        _guardian(FakeClient([ChatResult(content="not json")])).review("task", _action(), [])
+
+
+def test_model_guardian_rejects_bad_verdict():
+    with pytest.raises(ModelError, match="not return a valid verdict"):
+        _guardian(FakeClient([ChatResult(content='{"verdict": "maybe"}')])).review(
+            "task", _action(), []
+        )
+
+
+def test_model_guardian_prompt_marks_content_untrusted():
+    client = FakeClient([ChatResult(content='{"verdict": "allow", "reason": "Safe."}')])
+    _guardian(client).review("task", _action(), [])
+
+    system = client.calls[0]["messages"][0]["content"]
+    assert "untrusted" in system
+    assert "not instructions from the user" in system
+    assert client.calls[0]["tools"] is None
+
+
+def test_model_guardian_sends_task_action_and_trace():
+    client = FakeClient([ChatResult(content='{"verdict": "allow", "reason": "Safe."}')])
+    trace = [_event(1), _event(2)]
+    _guardian(client).review("summarize the ticket", _action(), trace)
+
+    user_message = client.calls[0]["messages"][1]["content"]
+    assert "summarize the ticket" in user_message
+    assert "send_email" in user_message
+    assert "[1]" in user_message and "[2]" in user_message
+    assert "action_proposed" in user_message
+
+
+def test_model_guardian_implements_guardian_protocol():
+    assert isinstance(_guardian(FakeClient([])), Guardian)
