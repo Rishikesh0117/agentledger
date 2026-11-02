@@ -13,6 +13,7 @@ from agentledger import (
     AutoDeny,
     FakeGuardian,
     LedgerStore,
+    ModelError,
     ScriptedAgent,
     Settings,
     default_context,
@@ -189,6 +190,45 @@ def test_guardian_flag_still_requires_approval(store, ctx):
         "run_finished",
     ]
     assert ctx.records["rec-001"]["status"] == "closed"
+    events = store.list_events(result.run.id)
+    requested = [e for e in events if e.event_type.value == "approval_requested"][0]
+    assert requested.payload["guardian_reason"] == "unusual but possibly legitimate"
+
+
+class FailingGuardian:
+    def review(self, task, action, trace):
+        raise ModelError("model API unreachable: boom")
+
+
+def test_guardian_failure_fails_closed(store, ctx):
+    agent = RecordingAgent(
+        [{"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}}]
+    )
+    result = run_agent("test task", "operator", agent, store, ctx, _settings(), guardian=FailingGuardian())
+
+    assert result.status == "completed"
+    assert (result.steps, result.tool_calls) == (1, 0)
+    assert _types(store, result.run.id) == [
+        "model_call",
+        "action_proposed",
+        "policy_blocked",
+        "run_finished",
+    ]
+    events = store.list_events(result.run.id)
+    blocked = [e for e in events if e.event_type.value == "policy_blocked"][0]
+    assert blocked.actor == "policy"
+    assert blocked.payload == {
+        "step": 1,
+        "tool": "update_status",
+        "args": {"record_id": "rec-001", "status": "closed"},
+        "rule": "guardian_unavailable",
+        "reason": "model API unreachable: boom",
+        "role": "operator",
+    }
+    assert [(a.tool, o["status"]) for a, o in agent.observed] == [("update_status", "blocked")]
+    assert agent.observed[0][1]["rule"] == "guardian_unavailable"
+    assert ctx.records["rec-001"]["status"] == "open"
+    assert store.verify_chain().ok
 
 
 def test_guardian_sees_task_action_and_trace(store, ctx):

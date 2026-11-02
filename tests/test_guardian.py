@@ -3,6 +3,7 @@
 Pure offline tests: FakeGuardian performs no model calls.
 """
 
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -161,3 +162,18 @@ def test_model_guardian_sends_task_action_and_trace():
 
 def test_model_guardian_implements_guardian_protocol():
     assert isinstance(_guardian(FakeClient([])), Guardian)
+
+
+@pytest.mark.parametrize("verdict", ["allow", "flag", "block"])
+@pytest.mark.parametrize("reason", ["", "   "])
+def test_model_guardian_rejects_empty_reason(verdict, reason):
+    content = json.dumps({"verdict": verdict, "reason": reason})
+    with pytest.raises(ModelError, match="valid verdict"):
+        _guardian(FakeClient([ChatResult(content=content)])).review("task", _action(), [])
+
+
+def test_model_guardian_rejects_missing_reason():
+    with pytest.raises(ModelError, match="valid verdict"):
+        _guardian(FakeClient([ChatResult(content='{"verdict": "block"}')])).review(
+            "task", _action(), []
+        )

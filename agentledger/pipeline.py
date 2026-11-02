@@ -9,6 +9,8 @@ Order per action:
 2. guardian review (``require_approval`` outcomes only)
    - ``block`` -> ``guardian_verdict`` + ``policy_blocked`` + skip
    - ``flag``/``allow`` -> ``guardian_verdict``, continue to approval
+   - review failure -> ``policy_blocked`` (``guardian_unavailable``) +
+     skip; no verdict is fabricated
 3. approval gate -> ``approval_requested``, ``approval_decision`` either
    way, execute only on approve
 4. tool execution -> ``tool_executed`` or ``tool_failed``
@@ -35,6 +37,7 @@ from agentledger.agent import BaseAgent, ProposedAction
 from agentledger.config import Settings
 from agentledger.guardian import AllowAllGuardian, Guardian
 from agentledger.ledger import EventType, LedgerStore, Run
+from agentledger.model import ModelError
 from agentledger.policy import evaluate
 from agentledger.tools import ToolContext, ToolError, run_tool
 
@@ -161,7 +164,25 @@ def run_agent(
             _notify(agent, action, {"status": "blocked", "reason": decision.reason, "rule": decision.rule})
             continue
         if decision.outcome == "require_approval":
-            verdict = guardian.review(task, action, store.list_events(run.id))
+            try:
+                verdict = guardian.review(task, action, store.list_events(run.id))
+            except ModelError as e:
+                reason = str(e)
+                store.append_event(
+                    run.id,
+                    EventType.POLICY_BLOCKED,
+                    "policy",
+                    {
+                        "step": steps,
+                        "tool": action.tool,
+                        "args": action.args,
+                        "rule": "guardian_unavailable",
+                        "reason": reason,
+                        "role": agent_role,
+                    },
+                )
+                _notify(agent, action, {"status": "blocked", "reason": reason, "rule": "guardian_unavailable"})
+                continue
             store.append_event(
                 run.id,
                 EventType.GUARDIAN_VERDICT,
@@ -185,17 +206,20 @@ def run_agent(
                 )
                 _notify(agent, action, {"status": "blocked", "reason": reason, "rule": "guardian_block"})
                 continue
+            request_payload: dict[str, Any] = {
+                "step": steps,
+                "tool": action.tool,
+                "args": action.args,
+                "rule": decision.rule,
+                "reason": decision.reason,
+            }
+            if verdict.verdict == "flag":
+                request_payload["guardian_reason"] = verdict.reason
             store.append_event(
                 run.id,
                 EventType.APPROVAL_REQUESTED,
                 "approval",
-                {
-                    "step": steps,
-                    "tool": action.tool,
-                    "args": action.args,
-                    "rule": decision.rule,
-                    "reason": decision.reason,
-                },
+                request_payload,
             )
             approval_decision = approval(task, action, steps)
             store.append_event(

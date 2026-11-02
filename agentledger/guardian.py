@@ -108,8 +108,11 @@ class ModelGuardian:
             ]
         )
         try:
-            return GuardianVerdict.model_validate(json.loads(extract_json(result.content)))
+            verdict = GuardianVerdict.model_validate(json.loads(extract_json(result.content)))
         except ModelError:
             raise
         except ValueError as e:
             raise ModelError(f"guardian did not return a valid verdict: {e}") from None
+        if not verdict.reason.strip():
+            raise ModelError("guardian did not return a valid verdict: empty reason")
+        return verdict
