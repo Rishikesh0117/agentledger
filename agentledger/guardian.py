@@ -61,3 +61,10 @@ class FakeGuardian:
             self._index += 1
             return verdict
         return GuardianVerdict(verdict="allow", reason="fake guardian script exhausted: default allow")
+
+
+class AllowAllGuardian:
+    """Allow everything. Pipeline default; the approval gate stays the backstop."""
+
+    def review(self, task: str, action: ProposedAction, trace: list[Event]) -> GuardianVerdict:
+        return GuardianVerdict(verdict="allow", reason="no guardian wired up: default allow")

@@ -29,12 +29,11 @@ from agentledger.model import (
     ToolCall,
     extract_json,
 )
+from agentledger.guardian import AllowAllGuardian, FakeGuardian, GuardianVerdict
 from agentledger.pipeline import (
-    AllowAllGuardian,
     ApprovalDecision,
     AutoApprove,
     AutoDeny,
-    GuardianVerdict,
     RunResult,
     run_agent,
 )
@@ -61,6 +60,7 @@ __all__ = [
     "Event",
     "EventType",
     "FINISH_TOOL",
+    "FakeGuardian",
     "GuardianVerdict",
     "LedgerStore",
     "ModelAgent",

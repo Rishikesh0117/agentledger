@@ -4,11 +4,14 @@ Order per action:
 
 1. policy check (agentledger.policy, the only policy check)
    - ``block`` -> ``policy_blocked`` + skip, outcome reported to the agent
-   - ``require_approval`` -> ``approval_requested``, consult the
-     approval gate, log ``approval_decision`` either way, execute only
-     on approve
+   - ``require_approval`` -> guardian review, then the approval gate
    - ``allow`` -> execute the tool
-2. tool execution -> ``tool_executed`` or ``tool_failed``
+2. guardian review (``require_approval`` outcomes only)
+   - ``block`` -> ``guardian_verdict`` + ``policy_blocked`` + skip
+   - ``flag``/``allow`` -> ``guardian_verdict``, continue to approval
+3. approval gate -> ``approval_requested``, ``approval_decision`` either
+   way, execute only on approve
+4. tool execution -> ``tool_executed`` or ``tool_failed``
 
 The pipeline logs ``model_call`` + ``action_proposed`` for every proposal
 and finishes with ``run_finished``. Every ``model_call`` carries the
@@ -24,20 +27,16 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol
 
 from pydantic import BaseModel
 
 from agentledger.agent import BaseAgent, ProposedAction
 from agentledger.config import Settings
+from agentledger.guardian import AllowAllGuardian, Guardian
 from agentledger.ledger import EventType, LedgerStore, Run
 from agentledger.policy import evaluate
 from agentledger.tools import ToolContext, ToolError, run_tool
-
-
-class GuardianVerdict(BaseModel):
-    verdict: Literal["allow", "flag", "block"]
-    reason: str = ""
 
 
 class ApprovalDecision(BaseModel):
@@ -45,19 +44,8 @@ class ApprovalDecision(BaseModel):
     decider: str = "auto-approve-stub"
 
 
-class GuardianReview(Protocol):
-    def __call__(self, task: str, action: ProposedAction, step: int) -> GuardianVerdict: ...
-
-
 class ApprovalGate(Protocol):
     def __call__(self, task: str, action: ProposedAction, step: int) -> ApprovalDecision: ...
-
-
-class AllowAllGuardian:
-    """Step 3 stub: allow everything. Step 6 calls the guardian model."""
-
-    def __call__(self, task: str, action: ProposedAction, step: int) -> GuardianVerdict:
-        return GuardianVerdict(verdict="allow", reason="stub: guardian not yet implemented")
 
 
 class AutoApprove:
@@ -96,7 +84,7 @@ def run_agent(
     store: LedgerStore,
     ctx: ToolContext,
     settings: Settings,
-    guardian: GuardianReview | None = None,
+    guardian: Guardian | None = None,
     approval: ApprovalGate | None = None,
     max_steps: int | None = None,
 ) -> RunResult:
@@ -109,8 +97,10 @@ def run_agent(
 
     ``approval`` decides ``require_approval`` outcomes and defaults to
     denying everything; pass a human-backed gate to approve.
-    ``guardian`` is still a seam for step 6 and is not consulted yet.
+    ``guardian`` reviews ``require_approval`` outcomes ahead of the
+    gate and defaults to allowing everything.
     """
+    guardian = guardian or AllowAllGuardian()
     approval = approval or AutoDeny()
     if max_steps is not None:
         cap = max_steps
@@ -171,6 +161,30 @@ def run_agent(
             _notify(agent, action, {"status": "blocked", "reason": decision.reason, "rule": decision.rule})
             continue
         if decision.outcome == "require_approval":
+            verdict = guardian.review(task, action, store.list_events(run.id))
+            store.append_event(
+                run.id,
+                EventType.GUARDIAN_VERDICT,
+                "guardian",
+                {"step": steps, "tool": action.tool, "verdict": verdict.verdict, "reason": verdict.reason},
+            )
+            if verdict.verdict == "block":
+                reason = f"guardian blocked: {verdict.reason}"
+                store.append_event(
+                    run.id,
+                    EventType.POLICY_BLOCKED,
+                    "policy",
+                    {
+                        "step": steps,
+                        "tool": action.tool,
+                        "args": action.args,
+                        "rule": "guardian_block",
+                        "reason": reason,
+                        "role": agent_role,
+                    },
+                )
+                _notify(agent, action, {"status": "blocked", "reason": reason, "rule": "guardian_block"})
+                continue
             store.append_event(
                 run.id,
                 EventType.APPROVAL_REQUESTED,

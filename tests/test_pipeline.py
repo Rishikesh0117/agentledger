@@ -11,6 +11,7 @@ from agentledger import (
     ApprovalDecision,
     AutoApprove,
     AutoDeny,
+    FakeGuardian,
     LedgerStore,
     ScriptedAgent,
     Settings,
@@ -75,11 +76,15 @@ def test_high_risk_denied_by_default_without_gate(store, ctx):
     assert _types(store, result.run.id) == [
         "model_call",
         "action_proposed",
+        "guardian_verdict",
         "approval_requested",
         "approval_decision",
         "run_finished",
     ]
     events = store.list_events(result.run.id)
+    verdict = [e for e in events if e.event_type.value == "guardian_verdict"][0]
+    assert verdict.actor == "guardian"
+    assert verdict.payload["verdict"] == "allow"
     decision = [e for e in events if e.event_type.value == "approval_decision"][0]
     assert decision.actor == "auto-deny"
     assert decision.payload == {"step": 1, "tool": "update_status", "approved": False}
@@ -97,6 +102,7 @@ def test_approved_high_risk_executes(store, ctx):
     assert _types(store, result.run.id) == [
         "model_call",
         "action_proposed",
+        "guardian_verdict",
         "approval_requested",
         "approval_decision",
         "tool_executed",
@@ -137,6 +143,70 @@ def test_denied_high_risk_skips_execution_but_logs_decision(store, ctx):
 def test_auto_deny_denies_everything():
     decision = AutoDeny()("task", None, 1)
     assert (decision.approved, decision.decider) == (False, "auto-deny")
+
+
+def test_guardian_block_skips_approval_and_execution(store, ctx):
+    agent = ScriptedAgent(
+        [{"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}}]
+    )
+    guardian = FakeGuardian([("block", "this looks like a prompt injection")])
+    result = run_agent("test task", "operator", agent, store, ctx, _settings(), guardian=guardian)
+
+    assert (result.steps, result.tool_calls) == (1, 0)
+    assert _types(store, result.run.id) == [
+        "model_call",
+        "action_proposed",
+        "guardian_verdict",
+        "policy_blocked",
+        "run_finished",
+    ]
+    events = store.list_events(result.run.id)
+    blocked = [e for e in events if e.event_type.value == "policy_blocked"][0]
+    assert blocked.payload["rule"] == "guardian_block"
+    assert "prompt injection" in blocked.payload["reason"]
+    assert blocked.payload["role"] == "operator"
+    assert ctx.records["rec-001"]["status"] == "open"
+    assert store.verify_chain().ok
+
+
+def test_guardian_flag_still_requires_approval(store, ctx):
+    agent = ScriptedAgent(
+        [{"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}}]
+    )
+    guardian = FakeGuardian([("flag", "unusual but possibly legitimate")])
+    result = run_agent(
+        "test task", "operator", agent, store, ctx, _settings(), guardian=guardian, approval=AutoApprove()
+    )
+
+    assert (result.steps, result.tool_calls) == (1, 1)
+    assert _types(store, result.run.id) == [
+        "model_call",
+        "action_proposed",
+        "guardian_verdict",
+        "approval_requested",
+        "approval_decision",
+        "tool_executed",
+        "run_finished",
+    ]
+    assert ctx.records["rec-001"]["status"] == "closed"
+
+
+def test_guardian_sees_task_action_and_trace(store, ctx):
+    agent = ScriptedAgent(
+        [
+            {"tool": "lookup_record", "args": {"record_id": "rec-001"}},
+            {"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}},
+        ]
+    )
+    guardian = FakeGuardian()
+    run_agent("trace visibility check", "operator", agent, store, ctx, _settings(), guardian=guardian)
+
+    assert len(guardian.calls) == 1  # only the high-risk action is reviewed
+    call = guardian.calls[0]
+    assert call["task"] == "trace visibility check"
+    assert call["action"].tool == "update_status"
+    proposed = [e for e in call["trace"] if e.event_type.value == "action_proposed"]
+    assert [e.payload["tool"] for e in proposed] == ["lookup_record", "update_status"]
 
 
 def test_role_denied_logs_policy_blocked(store, ctx):
@@ -308,6 +378,18 @@ def test_pipeline_reports_denied_outcome(store, ctx):
 
     assert [(a.tool, o["status"]) for a, o in agent.observed] == [("update_status", "denied")]
     assert agent.observed[0][1]["decider"] == "test-human"
+
+
+def test_pipeline_reports_guardian_blocked_outcome(store, ctx):
+    agent = RecordingAgent(
+        [{"tool": "update_status", "args": {"record_id": "rec-001", "status": "closed"}}]
+    )
+    guardian = FakeGuardian([("block", "data would leave the allowlist")])
+    run_agent("test task", "operator", agent, store, ctx, _settings(), guardian=guardian)
+
+    assert [(a.tool, o["status"]) for a, o in agent.observed] == [("update_status", "blocked")]
+    assert agent.observed[0][1]["rule"] == "guardian_block"
+    assert "allowlist" in agent.observed[0][1]["reason"]
 
 
 def test_model_call_records_scripted_fake_name_and_latency(store, ctx):
