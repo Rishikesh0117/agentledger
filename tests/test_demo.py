@@ -9,15 +9,38 @@ import sys
 
 import pytest
 
-from agentledger import EventType, LedgerStore, ProposedAction, default_context, run_tool
+from agentledger import (
+    ChatResult,
+    EventType,
+    LedgerStore,
+    ModelError,
+    ProposedAction,
+    default_context,
+    run_tool,
+)
 from agentledger.demo import (
     INJECTED_DOC_ID,
     NORMAL_DOC_ID,
     ConsoleApprovalGate,
+    ScenarioResult,
     demo_context,
     run_injection,
+    run_injection_live,
     run_normal,
+    summarize_live_injection,
 )
+
+
+class FakeChatClient:
+    """Stubbed model transport: replays one canned reply, records calls."""
+
+    def __init__(self, content):
+        self.content = content
+        self.calls = []
+
+    def chat(self, messages, tools=None):
+        self.calls.append([dict(m) for m in messages])
+        return ChatResult(content=self.content)
 
 
 def _action():
@@ -164,3 +187,93 @@ def test_console_gate_prints_request_context_from_store(monkeypatch, capsys, tmp
 
 def test_default_context_is_untouched_by_demo_docs():
     assert set(default_context().documents) == {"doc-001", "doc-002"}
+
+
+def test_injection_live_uses_model_guardian_with_stubbed_client(tmp_path):
+    client = FakeChatClient('{"verdict": "block", "reason": "Stubbed block for offline test."}')
+    result = run_injection_live(str(tmp_path / "demo.db"), guardian_client=client)
+
+    assert result.name == "injection-live"
+    assert result.status == "completed"
+    assert len(client.calls) == 1  # the model-backed guardian consulted its client once
+    assert result.verdict == "block"
+    assert result.executed_sends == 0
+    assert result.verify_ok
+
+
+def _proposed_actions(db_path, run_id):
+    with LedgerStore(db_path) as store:
+        return [
+            (e.payload["tool"], e.payload["args"])
+            for e in store.list_events(run_id)
+            if e.event_type.value == "action_proposed"
+        ]
+
+
+def test_injection_live_replays_same_actions_as_scripted(tmp_path):
+    scripted = run_injection(str(tmp_path / "s.db"))
+    live = run_injection_live(
+        str(tmp_path / "l.db"),
+        guardian_client=FakeChatClient('{"verdict": "block", "reason": "x"}'),
+    )
+
+    assert live.events == scripted.events
+    assert [b.split(":")[0] for b in live.blocked] == [b.split(":")[0] for b in scripted.blocked]
+    assert _proposed_actions(str(tmp_path / "l.db"), live.run_id) == _proposed_actions(
+        str(tmp_path / "s.db"), scripted.run_id
+    )
+
+
+def test_injection_live_missing_key_rejected_without_secrets(tmp_path, monkeypatch):
+    monkeypatch.setattr("agentledger.demo.get_api_key", lambda: None)
+    with pytest.raises(ModelError, match="META_MODEL_API_KEY"):
+        run_injection_live(str(tmp_path / "demo.db"))
+
+
+def _live_result(**overrides):
+    base = dict(
+        name="injection-live",
+        run_id="r",
+        db_path="d.db",
+        status="completed",
+        events=[],
+        blocked=[],
+        verify_ok=True,
+        broken_seq=None,
+        verdict="block",
+        verdict_reason="Some reason.",
+        executed_sends=0,
+    )
+    base.update(overrides)
+    return ScenarioResult(**base)
+
+
+def test_summarize_live_pass():
+    report, code = summarize_live_injection(_live_result(), "muse-spark", [])
+    assert code == 0
+    assert "LIVE RESULT: PASS" in report
+    assert "muse-spark" in report and "Some reason." in report and "block" in report
+
+
+def test_summarize_live_flag_verdict_fails():
+    report, code = summarize_live_injection(_live_result(verdict="flag"), "m", [])
+    assert code == 1
+    assert "flag" in report and "FAIL" in report
+
+
+def test_summarize_live_tripwire_and_chain_fail():
+    report, code = summarize_live_injection(
+        _live_result(executed_sends=1, verify_ok=False, broken_seq=9),
+        "m",
+        [{"to": "x"}],
+    )
+    assert code == 1
+    assert "TRIPWIRE" in report
+    assert "tripwire: 1 send_email executed" in report
+    assert "broken at seq 9" in report
+
+
+def test_summarize_live_empty_reason_fails():
+    report, code = summarize_live_injection(_live_result(verdict_reason="  "), "m", [])
+    assert code == 1
+    assert "empty" in report
