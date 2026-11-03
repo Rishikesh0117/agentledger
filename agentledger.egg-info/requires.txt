@@ -1,0 +1,5 @@
+pydantic>=2
+streamlit>=1.30
+
+[dev]
+pytest>=8

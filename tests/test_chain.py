@@ -148,6 +148,21 @@ def test_payload_key_order_does_not_change_hash(store):
     assert store.verify_chain().ok
 
 
+def test_list_runs_returns_all_runs_in_order(store):
+    a = _run(store, task="first", role="reader")
+    b = _run(store, task="second", role="operator")
+    runs = store.list_runs()
+
+    assert [(r.id, r.task, r.agent_role, r.status) for r in runs] == [
+        (a.id, "first", "reader", "running"),
+        (b.id, "second", "operator", "running"),
+    ]
+
+
+def test_list_runs_empty_db(store):
+    assert store.list_runs() == []
+
+
 def test_unknown_event_type_rejected(store):
     run = _run(store)
     with pytest.raises(ValueError):

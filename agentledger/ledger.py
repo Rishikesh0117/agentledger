@@ -153,6 +153,21 @@ class LedgerStore:
         self._db.commit()
         return run
 
+    def list_runs(self) -> list[Run]:
+        rows = self._db.execute(
+            "SELECT id, task, agent_role, started_at, status FROM runs ORDER BY started_at, id"
+        ).fetchall()
+        return [
+            Run(
+                id=rid,
+                task=task,
+                agent_role=agent_role,
+                started_at=datetime.fromisoformat(started_at),
+                status=status,
+            )
+            for rid, task, agent_role, started_at, status in rows
+        ]
+
     def get_run(self, run_id: str) -> Run:
         row = self._db.execute(
             "SELECT id, task, agent_role, started_at, status FROM runs WHERE id = ?", (run_id,)
