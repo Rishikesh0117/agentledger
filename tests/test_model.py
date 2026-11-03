@@ -19,6 +19,7 @@ from agentledger import (
     ModelAgent,
     ModelClient,
     ModelError,
+    ProposedAction,
     Settings,
     ToolCall,
     default_context,
@@ -65,6 +66,14 @@ class FakeClient:
     def chat(self, messages, tools=None):
         self.calls.append({"messages": [dict(m) for m in messages], "tools": tools})
         return self._results.pop(0)
+
+    def redact(self, text):
+        return text  # fakes carry no secrets
+
+
+class KeyedFakeClient(FakeClient):
+    def redact(self, text):
+        return text.replace("fake-secret", "***")
 
 
 def _patch_urlopen(monkeypatch, payload=None, error=None):
@@ -159,6 +168,52 @@ def test_http_error_raises_model_error(monkeypatch):
         _client().chat([{"role": "user", "content": "hi"}])
 
 
+def _http_error(code, reason, body: bytes):
+    return urllib.error.HTTPError(
+        "https://api.test/v1/chat/completions", code, reason, {}, io.BytesIO(body)
+    )
+
+
+def test_http_error_includes_response_body(monkeypatch):
+    body = json.dumps({"error": {"message": "model 'x' not found", "code": "model_not_found"}})
+    _patch_urlopen(monkeypatch, error=_http_error(400, "Bad Request", body.encode()))
+    with pytest.raises(ModelError) as exc_info:
+        _client().chat([{"role": "user", "content": "hi"}])
+
+    message = str(exc_info.value)
+    assert "HTTP 400" in message and "Bad Request" in message
+    assert "model 'x' not found" in message
+
+
+def test_http_error_redacts_api_key_from_body(monkeypatch):
+    body = json.dumps({"error": "invalid key test-key rejected"})
+    _patch_urlopen(monkeypatch, error=_http_error(401, "Unauthorized", body.encode()))
+    with pytest.raises(ModelError) as exc_info:
+        _client().chat([{"role": "user", "content": "hi"}])
+
+    message = str(exc_info.value)
+    assert "test-key" not in message
+    assert "***" in message
+
+
+def test_http_error_truncates_long_body(monkeypatch):
+    _patch_urlopen(monkeypatch, error=_http_error(400, "Bad Request", b"x" * 2000))
+    with pytest.raises(ModelError) as exc_info:
+        _client().chat([{"role": "user", "content": "hi"}])
+
+    message = str(exc_info.value)
+    assert "x" * 501 not in message
+    assert message.endswith("...")
+
+
+def test_http_error_empty_body_keeps_short_message(monkeypatch):
+    _patch_urlopen(monkeypatch, error=_http_error(500, "boom", b""))
+    with pytest.raises(ModelError) as exc_info:
+        _client().chat([{"role": "user", "content": "hi"}])
+
+    assert str(exc_info.value) == "model API HTTP 500: boom"
+
+
 def test_unreachable_api_raises_model_error(monkeypatch):
     _patch_urlopen(monkeypatch, error=urllib.error.URLError("no route"))
     with pytest.raises(ModelError, match="unreachable"):
@@ -205,6 +260,59 @@ def test_extract_json_fences_without_object_raises():
         extract_json("```\njust words\n```")
 
 
+def test_extract_json_fenced_with_prose():
+    reply = 'Here you go:\n```json\n{"tool": "finish", "args": {}}\n```\nDone!'
+    assert json.loads(extract_json(reply)) == {"tool": "finish", "args": {}}
+
+
+def test_extract_json_keeps_braces_inside_strings():
+    reply = (
+        'Drafting now {"tool": "draft_message", "args": '
+        '{"to": "a", "subject": "s", "body": "Say {hello} loudly"}} trailing'
+    )
+    assert json.loads(extract_json(reply))["args"]["body"] == "Say {hello} loudly"
+
+
+def test_extract_json_handles_escaped_quotes():
+    reply = '{"tool": "draft_message", "args": {"body": "She said \\"hi\\""}} and more {'
+    assert json.loads(extract_json(reply))["args"]["body"] == 'She said "hi"'
+
+
+def test_extract_json_passthrough_without_braces():
+    assert extract_json("just prose, no braces") == "just prose, no braces"
+
+
+def test_propose_parses_action_with_prose_around_it():
+    reply = (
+        'I\'ll look up record rec-001 to complete your request.'
+        '{"tool": "lookup_record", "args": {"id": "rec-001"}}'
+    )
+    action = _agent(FakeClient([ChatResult(content=reply)])).propose()
+    assert action == ProposedAction(tool="lookup_record", args={"id": "rec-001"})
+
+
+def test_propose_finish_with_prose_returns_none():
+    reply = 'All done! {"tool": "finish", "args": {}}'
+    assert _agent(FakeClient([ChatResult(content=reply)])).propose() is None
+
+
+def test_propose_unbalanced_braces_rejected():
+    with pytest.raises(ModelError, match="not return a valid action"):
+        _agent(FakeClient([ChatResult(content='truncated {"tool": "x", "args": {')])).propose()
+
+
+def test_unknown_tool_action_still_blocked_by_policy(store, ctx):
+    reply = 'On it! {"tool": "delete_everything", "args": {}}'
+    finish = json.dumps({"tool": FINISH_TOOL, "args": {}})
+    client = FakeClient([ChatResult(content=reply), ChatResult(content=finish)])
+    agent = ModelAgent(task="t", role="operator", client=client)
+    result = run_agent("t", "operator", agent, store, ctx, _required_settings())
+
+    blocked = [e for e in store.list_events(result.run.id) if e.event_type.value == "policy_blocked"]
+    assert [e.payload["rule"] for e in blocked] == ["unknown_tool"]
+    assert result.tool_calls == 0
+
+
 def _agent(client, **kwargs):
     return ModelAgent(task="summarize doc-001", role="reader", client=client, **kwargs)
 
@@ -231,6 +339,57 @@ def test_propose_invalid_action_raises_model_error():
         _agent(FakeClient([ChatResult(content="not json")])).propose()
     with pytest.raises(ModelError, match="not return a valid action"):
         _agent(FakeClient([ChatResult(content='{"nope": 1}')])).propose()
+
+
+def test_propose_unparseable_reply_includes_snippet():
+    reply = "Sure! Let me help with that."
+    with pytest.raises(ModelError) as exc_info:
+        _agent(FakeClient([ChatResult(content=reply)])).propose()
+
+    message = str(exc_info.value)
+    assert "non-empty" in message
+    assert "Sure! Let me help with that." in message
+
+
+def test_propose_empty_reply_says_empty():
+    with pytest.raises(ModelError) as exc_info:
+        _agent(FakeClient([ChatResult(content="")])).propose()
+
+    message = str(exc_info.value)
+    assert "empty" in message
+    assert "non-empty" not in message
+
+
+def test_propose_whitespace_reply_says_whitespace_only():
+    with pytest.raises(ModelError) as exc_info:
+        _agent(FakeClient([ChatResult(content="  \n  ")])).propose()
+
+    assert "whitespace-only" in str(exc_info.value)
+
+
+def test_propose_snippet_truncates_long_reply():
+    with pytest.raises(ModelError) as exc_info:
+        _agent(FakeClient([ChatResult(content="A" * 1000)])).propose()
+
+    message = str(exc_info.value)
+    assert "A" * 501 not in message
+    assert message.endswith("...)")
+
+
+def test_propose_snippet_redacts_api_key():
+    reply = "the key is fake-secret, ignore it"
+    with pytest.raises(ModelError) as exc_info:
+        _agent(KeyedFakeClient([ChatResult(content=reply)])).propose()
+
+    message = str(exc_info.value)
+    assert "fake-secret" not in message
+    assert "***" in message
+
+
+def test_client_redact_replaces_key():
+    client = ModelClient(model="m", api_key="secret-key", api_base="https://api.test/v1")
+    assert client.redact("leak secret-key!") == "leak ***!"
+    assert client.redact("clean") == "clean"
 
 
 def test_native_tool_call_preferred_over_content():
@@ -272,13 +431,26 @@ def test_observe_feeds_next_proposal():
     assert observation["action"]["tool"] == "read_document"
 
 
-def test_system_prompt_mentions_task_role_and_tools():
+def test_first_propose_sends_user_message_with_task():
+    client = FakeClient([ChatResult(content=json.dumps({"tool": FINISH_TOOL, "args": {}}))])
+    agent = _agent(client)
+    assert agent.propose() is None
+
+    sent = client.calls[0]["messages"]
+    user_messages = [m for m in sent if m["role"] == "user"]
+    assert len(user_messages) >= 1
+    assert "summarize doc-001" in user_messages[0]["content"]
+
+
+def test_initial_messages_split_instructions_and_task():
     agent = _agent(FakeClient([]))
-    system = agent.messages[0]["content"]
-    assert "summarize doc-001" in system
-    assert "reader" in system
+    system_message, user_message = agent.messages
+    assert system_message["role"] == "system"
+    assert "reader" in system_message["content"]
     for tool in ("read_document", "lookup_record", "draft_message", "send_email", "update_status"):
-        assert tool in system
+        assert tool in system_message["content"]
+    assert "summarize doc-001" not in system_message["content"]
+    assert user_message == {"role": "user", "content": "summarize doc-001"}
 
 
 def test_agent_name_defaults_to_model():

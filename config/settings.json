@@ -1,6 +1,6 @@
 {
-  "agent_model": "muse-spark",
-  "guardian_model": "muse-spark",
+  "agent_model": "muse-spark-1.1",
+  "guardian_model": "muse-spark-1.2",
   "email_allowlist": ["example.com"],
   "max_tool_calls": 10,
   "db_path": "agentledger.db",

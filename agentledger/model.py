@@ -72,6 +72,12 @@ class ModelClient:
             timeout=settings.model_timeout,
         )
 
+    def redact(self, text: str) -> str:
+        """Replace any occurrence of this client's API key with ***."""
+        if self._api_key:
+            text = text.replace(self._api_key, "***")
+        return text
+
     def chat(
         self, messages: list[dict[str, str]], tools: list[dict[str, Any]] | None = None
     ) -> ChatResult:
@@ -88,12 +94,27 @@ class ModelClient:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            raise ModelError(f"model API HTTP {e.code}: {e.reason}") from None
+            raise ModelError(f"model API HTTP {e.code}: {e.reason}{self._error_detail(e)}") from None
         except urllib.error.URLError as e:
             raise ModelError(f"model API unreachable: {e.reason}") from None
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             raise ModelError(f"model API returned invalid JSON: {e}") from None
         return self._parse_response(payload)
+
+    def _error_detail(self, error: urllib.error.HTTPError) -> str:
+        """Readable error-body suffix with secrets redacted ("" when empty)."""
+        try:
+            raw = error.read()
+        except (OSError, ValueError):
+            return ""
+        body = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+        # Covers an echoed Bearer value too, since it embeds the key.
+        body = self.redact(body).strip()
+        if not body:
+            return ""
+        if len(body) > 500:
+            body = body[:500] + "..."
+        return f" — {body}"
 
     @staticmethod
     def _parse_response(payload: Any) -> ChatResult:
@@ -119,15 +140,58 @@ class ModelClient:
         return result
 
 
+def _matching_brace(text: str, start: int) -> int | None:
+    """Index of the `}` closing the `{` at `start`, or None if unbalanced.
+
+    Braces inside JSON strings do not count; backslash escapes (including
+    escaped quotes) are honored. Only double-quoted strings exist in JSON.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
 def extract_json(text: str) -> str:
-    """Pull the JSON object out of a model reply (strips ``` fences)."""
-    text = text.strip()
-    if text.startswith("```"):
-        start = text.find("{")
-        end = text.rfind("}")
-        if start == -1 or end == -1 or end < start:
-            raise ModelError("model reply has no JSON object inside code fences")
-        return text[start : end + 1]
+    """Find the first complete, balanced JSON object in a model reply.
+
+    Tolerates prose around the object and ``` fences. Candidates that
+    are balanced but not valid JSON are skipped. Without braces the
+    text passes through untouched, so downstream parsers raise exactly
+    as before; fenced replies with no object raise here, as before.
+    """
+    start = text.find("{")
+    while start != -1:
+        end = _matching_brace(text, start)
+        if end is not None:
+            candidate = text[start : end + 1]
+            try:
+                json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+            else:
+                return candidate
+        start = text.find("{", start + 1)
+    if text.strip().startswith("```"):
+        raise ModelError("model reply has no JSON object inside code fences")
     return text
 
 
@@ -150,9 +214,9 @@ def _tool_schemas(specs: dict[str, ToolSpec]) -> list[dict[str, Any]]:
     return schemas
 
 
-def _system_prompt(task: str, role: str, specs: dict[str, ToolSpec]) -> str:
+def _system_prompt(role: str, specs: dict[str, ToolSpec]) -> str:
     lines = [
-        f"You are an AI agent with role {role!r}. Complete this task: {task}",
+        f"You are an AI agent with role {role!r}. Complete the task from the user message.",
         "",
         "Reply with exactly one JSON object per step: {\"tool\": ..., \"args\": {...}}.",
         f"When the task is complete, reply with {{\"tool\": \"{FINISH_TOOL}\", \"args\": {{}}}}.",
@@ -184,7 +248,8 @@ class ModelAgent:
         self._specs = specs if specs is not None else TOOLS
         self._native_tools = native_tools
         self._messages: list[dict[str, str]] = [
-            {"role": "system", "content": _system_prompt(task, role, self._specs)}
+            {"role": "system", "content": _system_prompt(role, self._specs)},
+            {"role": "user", "content": task},
         ]
 
     @property
@@ -203,11 +268,27 @@ class ModelAgent:
             return ProposedAction(tool=call.name, args=call.args)
         try:
             action = parse_action_json(extract_json(result.content))
-        except ValueError as e:
-            raise ModelError(f"model did not return a valid action: {e}") from None
+        except (ValueError, ModelError) as e:
+            raise ModelError(
+                f"model did not return a valid action: {e} ({self._reply_diagnostic(result.content)})"
+            ) from None
         if action.tool == FINISH_TOOL:
             return None
         return action
+
+    def _reply_diagnostic(self, content: str | None) -> str:
+        """Safe one-line description of an unparseable model reply."""
+        text = content or ""
+        if not text:
+            state = "empty"
+        elif not text.strip():
+            state = "whitespace-only"
+        else:
+            state = "non-empty"
+        snippet = repr(text)
+        if len(snippet) > 500:
+            snippet = snippet[:500] + "..."
+        return f"reply was {state}: {self._client.redact(snippet)}"
 
     def observe(self, action: ProposedAction, outcome: dict[str, Any]) -> None:
         """Record what the pipeline did with an action, for the next proposal."""
