@@ -195,32 +195,47 @@ demo (any execution there would prove a layer failed).
   policy_blocked [guardian_block] with guardian's reason. Only
   read_document executes; outbox empty; verify: OK.
 
-## 11. Verification status (as of Nov 3, 2026)
+## 11. Verification status
 
-- Offline test suite green (174 passed, 1 skipped at Step 8 completion;
-  the skip was the gated live test; more offline tests added since for
-  model diagnostics/parsing).
-- LIVE tests (`tests/test_live_smoke.py`, gated by env
-  `AGENTLEDGER_RUN_LIVE_TESTS=1` + `META_MODEL_API_KEY`): 3 passed in 21s:
-  1) real agent `propose()` returns a valid action;
-  2) real agent (reader role) runs through the full pipeline with
-     verify_chain OK;
-  3) real ModelGuardian blocks the injection send (scripted agent,
-     AutoApprove tripwire) — no email executed, chain OK.
-- Dashboard manually verified in browser: both runs render, blocked
-  panel shows both rules/reasons, "Audit log OK (27 events checked)".
-- Tamper test manually verified: copied DB, `UPDATE events SET
-  payload='{}' WHERE seq=5`, dashboard reported
+### Offline tests
+- Scripted test suite: **200 passed, 3 skipped**
+- The 3 skipped tests are the live Meta Model API tests, which only run
+  when explicitly enabled.
+
+### Live Muse Spark tests
+Live tests (`tests/test_live_smoke.py`, gated by
+`AGENTLEDGER_RUN_LIVE_TESTS=1` + `META_MODEL_API_KEY`): **3 passed**
+
+1. Real agent `propose()` returns a valid structured action.
+2. Real agent (reader role) runs through the full pipeline —
+   policy → tools → ledger → `verify_chain()` OK.
+3. Real `ModelGuardian` blocks the injection send (scripted agent,
+   `AutoApprove` as tripwire) — no email executed, chain OK.
+
+### Live-guardian demo rehearsal (muse-spark-1.2)
+**3/3 runs blocked** the injected `send_email`, each with a distinct
+plain-language reason citing the untrusted document instruction and
+the attempt to bypass the earlier policy block by switching to an
+allowlisted address. No `send_email` executed in any run, outbox
+remained empty, `verify_chain()` OK every time, ~7–10s per run.
+
+### Dashboard (manually verified in browser)
+- Both demo runs render; blocked-actions panel shows both rules and
+  the guardian's reason; "Audit log OK (27 events checked)".
+- Tamper test verified: copied DB, `UPDATE events SET payload='{}'
+  WHERE seq=5`, dashboard reported
   "Broken at seq 5: hash mismatch".
 
-Debugging history worth remembering (real bugs found by the live smoke):
+### Debugging history (real bugs found via live smoke runs)
 1. Agent sent system-only messages → API 400 (needs a user message).
-2. `muse-spark` was not a real model ID → 404 model_not_found;
-   fixed by using listed IDs (1.1/1.2).
-3. Model replied with prose before the JSON action → strict parser
-   failed; fixed by balanced-object extraction WITHOUT weakening
-   validation.
-
+   Fixed: task is sent as a user message.
+2. Bare `muse-spark` was not a valid model ID → 404 model_not_found.
+   Fixed: use exact versioned IDs from `GET /v1/models`
+   (`muse-spark-1.1` agent, `muse-spark-1.2` guardian).
+3. Model replied with short prose before the JSON action → strict
+   parser failed. Fixed: balanced-JSON-object extraction that
+   tolerates surrounding prose WITHOUT weakening validation.
+   
 ## 12. Safety invariants (never violate these)
 
 - Nothing executes before passing policy + (guardian + approval if
@@ -234,29 +249,25 @@ Debugging history worth remembering (real bugs found by the live smoke):
 - API keys never appear in code, logs, or error messages (redacted).
 - Default approval gate is AutoDeny (fail closed).
 
-## 13. What remains
 
-Step 9 only (packaging):
-- README (must state what was built during the hackathon + which Meta
-  models are used where)
-- Architecture diagram for README/submission
-- 3-minute demo video: (1) normal run ~60s, (2) prompt injection ~70s,
-  (3) tamper test ~40s, (4) closing: what was built + models used
-- Screenshots of dashboard (incl. the "Broken at seq 5" tamper result)
-- Submission text; repo public and clean; solo contributor named
-- Submit Nov 4 before 9 PM ET
+## 14. Development notes
 
-Optional (only with 6+ hours spare, never at the expense of Step 9):
-Streamlit Cloud deployment (note: cloud filesystem is ephemeral —
-seed the DB on startup by running the scripted scenarios; tamper test
-stays local), loop detection, cost/latency charts.
-
-## 14. Instructions for the assistant reading this
-
-- Follow PLAN.md; work in small steps; write tests first for core logic;
-  report what changed after each step and run the FULL test suite.
-- Do not change pipeline/policy/guardian/hash-chain semantics without
-  flagging it first. No new event types. No new dependencies without
-  asking. Never print or request the contents of `.env`.
-- The scripted offline demo is the on-camera path; the live tests are
-  the proof the real models work. Explain it that way in all docs.
+- Work follows PLAN.md: small steps, tests first for core logic
+  (hash chain and policy engine were tested before any model calls),
+  full test suite run after each step.
+- Never change pipeline/policy/guardian/hash-chain semantics
+  silently. No new event types. No new dependencies without a
+  reason. Appends are the only write to the `events` table; the
+  dashboard opens the DB read-only.
+- Model names and API keys live only in `config/settings.json` and
+  `.env`. `.env` is git-ignored, never committed, and its contents
+  are never printed (API errors redact the key to `***`).
+- All demo data is synthetic; the injected document uses the
+  reserved `outside.example` domain.
+- The author must be able to explain every module. Keep the code
+  readable and the modules small.
+- Transparency note: the scripted scenarios exist so the demo is
+  deterministic and reviewable offline; live Muse Spark behaviour
+  (agent through the pipeline, guardian blocking the injection) is
+  separately proven by the gated live tests above. Both facts are
+  stated openly in the README and submission.
